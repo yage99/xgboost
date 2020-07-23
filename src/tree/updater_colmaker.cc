@@ -5,17 +5,18 @@
  * \author Tianqi Chen
  */
 #include <rabit/rabit.h>
-#include <xgboost/tree_updater.h>
-#include <xgboost/logging.h>
 #include <memory>
 #include <vector>
 #include <cmath>
 #include <algorithm>
 
+#include "xgboost/parameter.h"
+#include "xgboost/tree_updater.h"
+#include "xgboost/logging.h"
+#include "xgboost/json.h"
 #include "param.h"
 #include "constraints.h"
 #include "../common/random.h"
-#include "../common/bitmap.h"
 #include "split_evaluator.h"
 
 namespace xgboost {
@@ -23,22 +24,84 @@ namespace tree {
 
 DMLC_REGISTRY_FILE_TAG(updater_colmaker);
 
+struct ColMakerTrainParam : XGBoostParameter<ColMakerTrainParam> {
+  // speed optimization for dense column
+  float opt_dense_col;
+  DMLC_DECLARE_PARAMETER(ColMakerTrainParam) {
+    DMLC_DECLARE_FIELD(opt_dense_col)
+        .set_range(0.0f, 1.0f)
+        .set_default(1.0f)
+        .describe("EXP Param: speed optimization for dense column.");
+  }
+
+  /*! \brief whether need forward small to big search: default right */
+  inline bool NeedForwardSearch(int default_direction, float col_density,
+                                bool indicator) const {
+    return default_direction == 2 ||
+           (default_direction == 0 && (col_density < opt_dense_col) &&
+            !indicator);
+  }
+  /*! \brief whether need backward big to small search: default left */
+  inline bool NeedBackwardSearch(int default_direction) const {
+    return default_direction != 2;
+  }
+};
+
+DMLC_REGISTER_PARAMETER(ColMakerTrainParam);
+
 /*! \brief column-wise update to construct a tree */
 class ColMaker: public TreeUpdater {
  public:
   void Configure(const Args& args) override {
     param_.UpdateAllowUnknown(args);
-    spliteval_.reset(SplitEvaluator::Create(param_.split_evaluator));
-    spliteval_->Init(args);
+    colmaker_param_.UpdateAllowUnknown(args);
+    if (!spliteval_) {
+      spliteval_.reset(SplitEvaluator::Create(param_.split_evaluator));
+    }
+    spliteval_->Init(&param_);
+  }
+
+  void LoadConfig(Json const& in) override {
+    auto const& config = get<Object const>(in);
+    FromJson(config.at("train_param"), &this->param_);
+    FromJson(config.at("colmaker_train_param"), &this->colmaker_param_);
+  }
+  void SaveConfig(Json* p_out) const override {
+    auto& out = *p_out;
+    out["train_param"] = ToJson(param_);
+    out["colmaker_train_param"] = ToJson(colmaker_param_);
   }
 
   char const* Name() const override {
     return "grow_colmaker";
   }
 
+  void LazyGetColumnDensity(DMatrix *dmat) {
+    // Finds densities if we don't already have them
+    if (column_densities_.empty()) {
+      std::vector<size_t> column_size(dmat->Info().num_col_);
+      for (const auto &batch : dmat->GetBatches<SortedCSCPage>()) {
+        for (auto i = 0u; i < batch.Size(); i++) {
+          column_size[i] += batch[i].size();
+        }
+      }
+      column_densities_.resize(column_size.size());
+      for (auto i = 0u; i < column_densities_.size(); i++) {
+        size_t nmiss = dmat->Info().num_row_ - column_size[i];
+        column_densities_[i] =
+            1.0f - (static_cast<float>(nmiss)) / dmat->Info().num_row_;
+      }
+    }
+  }
+
   void Update(HostDeviceVector<GradientPair> *gpair,
               DMatrix* dmat,
               const std::vector<RegTree*> &trees) override {
+    if (rabit::IsDistributed()) {
+      LOG(FATAL) << "Updater `grow_colmaker` or `exact` tree method doesn't "
+                    "support distributed training.";
+    }
+    this->LazyGetColumnDensity(dmat);
     // rescale learning rate according to size of trees
     float lr = param_.learning_rate;
     param_.learning_rate = lr / trees.size();
@@ -47,8 +110,9 @@ class ColMaker: public TreeUpdater {
     for (auto tree : trees) {
       Builder builder(
         param_,
+        colmaker_param_,
         std::unique_ptr<SplitEvaluator>(spliteval_->GetHostClone()),
-        interaction_constraints_);
+        interaction_constraints_, column_densities_);
       builder.Update(gpair->ConstHostVector(), dmat, tree);
     }
     param_.learning_rate = lr;
@@ -57,8 +121,10 @@ class ColMaker: public TreeUpdater {
  protected:
   // training parameter
   TrainParam param_;
+  ColMakerTrainParam colmaker_param_;
   // SplitEvaluator that will be cloned for each Builder
   std::unique_ptr<SplitEvaluator> spliteval_;
+  std::vector<float> column_densities_;
 
   FeatureInteractionConstraintHost interaction_constraints_;
   // data structure
@@ -66,39 +132,39 @@ class ColMaker: public TreeUpdater {
   struct ThreadEntry {
     /*! \brief statistics of data */
     GradStats stats;
-    /*! \brief extra statistics of data */
-    GradStats stats_extra;
     /*! \brief last feature value scanned */
-    bst_float last_fvalue;
-    /*! \brief first feature value scanned */
-    bst_float first_fvalue;
+    bst_float last_fvalue { 0 };
     /*! \brief current best solution */
     SplitEntry best;
     // constructor
-    ThreadEntry() : last_fvalue{0}, first_fvalue{0} {}
+    ThreadEntry() = default;
   };
   struct NodeEntry {
     /*! \brief statics for node entry */
     GradStats stats;
     /*! \brief loss of this node, without split */
-    bst_float root_gain;
+    bst_float root_gain { 0.0f };
     /*! \brief weight calculated related to current data */
-    bst_float weight;
+    bst_float weight { 0.0f };
     /*! \brief current best solution */
     SplitEntry best;
     // constructor
-    NodeEntry() : root_gain{0.0f}, weight{0.0f} {}
+    NodeEntry() = default;
   };
   // actual builder that runs the algorithm
   class Builder {
    public:
     // constructor
     explicit Builder(const TrainParam& param,
+                     const ColMakerTrainParam& colmaker_train_param,
                      std::unique_ptr<SplitEvaluator> spliteval,
-                     FeatureInteractionConstraintHost _interaction_constraints)
-        : param_(param), nthread_(omp_get_max_threads()),
+                     FeatureInteractionConstraintHost _interaction_constraints,
+                     const std::vector<float> &column_densities)
+        : param_(param), colmaker_train_param_{colmaker_train_param},
+          nthread_(omp_get_max_threads()),
           spliteval_(std::move(spliteval)),
-          interaction_constraints_{std::move(_interaction_constraints)} {}
+          interaction_constraints_{std::move(_interaction_constraints)},
+          column_densities_(column_densities) {}
     // update one tree, growing
     virtual void Update(const std::vector<GradientPair>& gpair,
                         DMatrix* p_fmat,
@@ -146,27 +212,20 @@ class ColMaker: public TreeUpdater {
     inline void InitData(const std::vector<GradientPair>& gpair,
                          const DMatrix& fmat,
                          const RegTree& tree) {
-      CHECK_EQ(tree.param.num_nodes, tree.param.num_roots)
-          << "ColMaker: can only grow new tree";
-      const std::vector<unsigned>& root_index = fmat.Info().root_index_;
       {
         // setup position
         position_.resize(gpair.size());
         CHECK_EQ(fmat.Info().num_row_, position_.size());
-        if (root_index.size() == 0) {
-          std::fill(position_.begin(), position_.end(), 0);
-        } else {
-          for (size_t ridx = 0; ridx <  position_.size(); ++ridx) {
-            position_[ridx] = root_index[ridx];
-            CHECK_LT(root_index[ridx], (unsigned)tree.param.num_roots);
-          }
-        }
+        std::fill(position_.begin(), position_.end(), 0);
         // mark delete for the deleted datas
         for (size_t ridx = 0; ridx < position_.size(); ++ridx) {
           if (gpair[ridx].GetHess() < 0.0f) position_[ridx] = ~position_[ridx];
         }
         // mark subsample
         if (param_.subsample < 1.0f) {
+          CHECK_EQ(param_.sampling_method, TrainParam::kUniform)
+            << "Only uniform sampling is supported, "
+            << "gradient-based sampling is only support by GPU Hist.";
           std::bernoulli_distribution coin_flip(param_.subsample);
           auto& rnd = common::GlobalRandom();
           for (size_t ridx = 0; ridx < position_.size(); ++ridx) {
@@ -192,9 +251,7 @@ class ColMaker: public TreeUpdater {
       {
         // expand query
         qexpand_.reserve(256); qexpand_.clear();
-        for (int i = 0; i < tree.param.num_roots; ++i) {
-          qexpand_.push_back(i);
-        }
+        qexpand_.push_back(0);
       }
     }
     /*!
@@ -251,152 +308,7 @@ class ColMaker: public TreeUpdater {
         }
       }
     }
-    // parallel find the best split of current fid
-    // this function does not support nested functions
-    inline void ParallelFindSplit(const SparsePage::Inst &col,
-                                  bst_uint fid,
-                                  DMatrix *p_fmat,
-                                  const std::vector<GradientPair> &gpair) {
-      // TODO(tqchen): double check stats order.
-      const bool ind = col.size() != 0 && col[0].fvalue == col[col.size() - 1].fvalue;
-      auto col_density = p_fmat->GetColDensity(fid);
-      bool need_forward = param_.NeedForwardSearch(col_density, ind);
-      bool need_backward = param_.NeedBackwardSearch(col_density, ind);
-      const std::vector<int> &qexpand = qexpand_;
-      #pragma omp parallel
-      {
-        const int tid = omp_get_thread_num();
-        std::vector<ThreadEntry> &temp = stemp_[tid];
-        // cleanup temp statistics
-        for (int j : qexpand) {
-          temp[j].stats = GradStats();
-        }
-        bst_uint step = (col.size() + this->nthread_ - 1) / this->nthread_;
-        bst_uint end = std::min(static_cast<bst_uint>(col.size()), step * (tid + 1));
-        for (bst_uint i = tid * step; i < end; ++i) {
-          const bst_uint ridx = col[i].index;
-          const int nid = position_[ridx];
-          if (nid < 0) continue;
-          const bst_float fvalue = col[i].fvalue;
-          if (temp[nid].stats.Empty()) {
-            temp[nid].first_fvalue = fvalue;
-          }
-          temp[nid].stats.Add(gpair[ridx]);
-          temp[nid].last_fvalue = fvalue;
-        }
-      }
-      // start collecting the partial sum statistics
-      auto nnode = static_cast<bst_omp_uint>(qexpand.size());
-      #pragma omp parallel for schedule(static)
-      for (bst_omp_uint j = 0; j < nnode; ++j) {
-        const int nid = qexpand[j];
-        GradStats sum, tmp, c;
-        for (int tid = 0; tid < this->nthread_; ++tid) {
-          tmp = stemp_[tid][nid].stats;
-          stemp_[tid][nid].stats = sum;
-          sum.Add(tmp);
-          if (tid != 0) {
-            std::swap(stemp_[tid - 1][nid].last_fvalue, stemp_[tid][nid].first_fvalue);
-          }
-        }
-        for (int tid = 0; tid < this->nthread_; ++tid) {
-          stemp_[tid][nid].stats_extra = sum;
-          ThreadEntry &e = stemp_[tid][nid];
-          bst_float fsplit;
-          if (tid != 0) {
-            if (stemp_[tid - 1][nid].last_fvalue != e.first_fvalue) {
-              fsplit = (stemp_[tid - 1][nid].last_fvalue + e.first_fvalue) * 0.5f;
-            } else {
-              continue;
-            }
-          } else {
-            fsplit = e.first_fvalue - kRtEps;
-          }
-          if (need_forward && tid != 0) {
-            c.SetSubstract(snode_[nid].stats, e.stats);
-            if (c.sum_hess >= param_.min_child_weight &&
-                e.stats.sum_hess >= param_.min_child_weight) {
-              auto loss_chg = static_cast<bst_float>(
-                  spliteval_->ComputeSplitScore(nid, fid, e.stats, c) -
-                  snode_[nid].root_gain);
-              e.best.Update(loss_chg, fid, fsplit, false, e.stats, c);
-            }
-          }
-          if (need_backward) {
-            tmp.SetSubstract(sum, e.stats);
-            c.SetSubstract(snode_[nid].stats, tmp);
-            if (c.sum_hess >= param_.min_child_weight &&
-                tmp.sum_hess >= param_.min_child_weight) {
-              auto loss_chg = static_cast<bst_float>(
-                  spliteval_->ComputeSplitScore(nid, fid, tmp, c) -
-                  snode_[nid].root_gain);
-              e.best.Update(loss_chg, fid, fsplit, true, tmp, c);
-            }
-          }
-        }
-        if (need_backward) {
-          tmp = sum;
-          ThreadEntry &e = stemp_[this->nthread_-1][nid];
-          c.SetSubstract(snode_[nid].stats, tmp);
-          if (c.sum_hess >= param_.min_child_weight &&
-              tmp.sum_hess >= param_.min_child_weight) {
-            auto loss_chg = static_cast<bst_float>(
-                spliteval_->ComputeSplitScore(nid, fid, tmp, c) -
-                snode_[nid].root_gain);
-            e.best.Update(loss_chg, fid, e.last_fvalue + kRtEps, true, tmp, c);
-          }
-        }
-      }
-      // rescan, generate candidate split
-#pragma omp parallel
-      {
-        GradStats c, cright;
-        const int tid = omp_get_thread_num();
-        std::vector<ThreadEntry> &temp = stemp_[tid];
-        bst_uint step = (col.size() + this->nthread_ - 1) / this->nthread_;
-        bst_uint end = std::min(static_cast<bst_uint>(col.size()), step * (tid + 1));
-        for (bst_uint i = tid * step; i < end; ++i) {
-          const bst_uint ridx = col[i].index;
-          const int nid = position_[ridx];
-          if (nid < 0) continue;
-          const bst_float fvalue = col[i].fvalue;
-          // get the statistics of nid
-          ThreadEntry &e = temp[nid];
-          if (e.stats.Empty()) {
-            e.stats.Add(gpair[ridx]);
-            e.first_fvalue = fvalue;
-          } else {
-            // forward default right
-            if (fvalue != e.first_fvalue) {
-              if (need_forward) {
-                c.SetSubstract(snode_[nid].stats, e.stats);
-                if (c.sum_hess >= param_.min_child_weight &&
-                    e.stats.sum_hess >= param_.min_child_weight) {
-                  auto loss_chg = static_cast<bst_float>(
-                      spliteval_->ComputeSplitScore(nid, fid, e.stats, c) -
-                      snode_[nid].root_gain);
-                  e.best.Update(loss_chg, fid, (fvalue + e.first_fvalue) * 0.5f,
-                                false, e.stats, c);
-                }
-              }
-              if (need_backward) {
-                cright.SetSubstract(e.stats_extra, e.stats);
-                c.SetSubstract(snode_[nid].stats, cright);
-                if (c.sum_hess >= param_.min_child_weight &&
-                    cright.sum_hess >= param_.min_child_weight) {
-                  auto loss_chg = static_cast<bst_float>(
-                      spliteval_->ComputeSplitScore(nid, fid, c, cright) -
-                      snode_[nid].root_gain);
-                  e.best.Update(loss_chg, fid, (fvalue + e.first_fvalue) * 0.5f, true, c, cright);
-                }
-              }
-            }
-            e.stats.Add(gpair[ridx]);
-            e.first_fvalue = fvalue;
-          }
-        }
-      }
-    }
+
     // update enumeration solution
     inline void UpdateEnumeration(int nid, GradientPair gstats,
                                   bst_float fvalue, int d_step, bst_uint fid,
@@ -421,10 +333,10 @@ class ColMaker: public TreeUpdater {
               bst_float proposed_split = (fvalue + e.last_fvalue) * 0.5f;
               if ( proposed_split == fvalue ) {
                 e.best.Update(loss_chg, fid, e.last_fvalue,
-                            d_step == -1, c, e.stats);
+                              d_step == -1, c, e.stats);
               } else {
                 e.best.Update(loss_chg, fid, proposed_split,
-                            d_step == -1, c, e.stats);
+                              d_step == -1, c, e.stats);
               }
             } else {
               loss_chg = static_cast<bst_float>(
@@ -541,27 +453,19 @@ class ColMaker: public TreeUpdater {
           std::max(static_cast<int>(num_features / this->nthread_ / 32), 1);
 #endif  // defined(_OPENMP)
 
-      CHECK_EQ(param_.parallel_option, 0) << "Support for `parallel_option' is removed in 1.0.0";
       {
-        std::vector<float> densities(num_features);
-        CHECK_EQ(feat_set.size(), num_features);
-        for (bst_omp_uint i = 0; i < num_features; ++i) {
-          bst_feature_t const fid = feat_set[i];
-          densities.at(i) = p_fmat->GetColDensity(fid);
-        }
-
 #pragma omp parallel for schedule(dynamic, batch_size)
         for (bst_omp_uint i = 0; i < num_features; ++i) {
           bst_feature_t const fid = feat_set[i];
           int32_t const tid = omp_get_thread_num();
           auto c = batch[fid];
           const bool ind = c.size() != 0 && c[0].fvalue == c[c.size() - 1].fvalue;
-          auto const density = densities[i];
-          if (param_.NeedForwardSearch(density, ind)) {
+          if (colmaker_train_param_.NeedForwardSearch(
+                  param_.default_direction, column_densities_[fid], ind)) {
             this->EnumerateSplit(c.data(), c.data() + c.size(), +1,
                                  fid, gpair, stemp_[tid]);
           }
-          if (param_.NeedBackwardSearch(density, ind)) {
+          if (colmaker_train_param_.NeedBackwardSearch(param_.default_direction)) {
             this->EnumerateSplit(c.data() + c.size() - 1, c.data() - 1, -1,
                                  fid, gpair, stemp_[tid]);
           }
@@ -594,7 +498,9 @@ class ColMaker: public TreeUpdater {
           p_tree->ExpandNode(nid, e.best.SplitIndex(), e.best.split_value,
                              e.best.DefaultLeft(), e.weight, left_leaf_weight,
                              right_leaf_weight, e.best.loss_chg,
-                             e.stats.sum_hess);
+                             e.stats.sum_hess,
+                             e.best.left_sum.GetHess(), e.best.right_sum.GetHess(),
+                             0);
         } else {
           (*p_tree)[nid].SetLeaf(e.weight * param_.learning_rate);
         }
@@ -691,6 +597,7 @@ class ColMaker: public TreeUpdater {
     }
     //  --data fields--
     const TrainParam& param_;
+    const ColMakerTrainParam& colmaker_train_param_;
     // number of omp thread used during training
     const int nthread_;
     common::ColumnSampler column_sampler_;
@@ -706,167 +613,14 @@ class ColMaker: public TreeUpdater {
     std::unique_ptr<SplitEvaluator> spliteval_;
 
     FeatureInteractionConstraintHost interaction_constraints_;
+    const std::vector<float> &column_densities_;
   };
-};
-
-// distributed column maker
-class DistColMaker : public ColMaker {
- public:
-  void Configure(const Args& args) override {
-    param_.UpdateAllowUnknown(args);
-    pruner_.reset(TreeUpdater::Create("prune", tparam_));
-    pruner_->Configure(args);
-    spliteval_.reset(SplitEvaluator::Create(param_.split_evaluator));
-    spliteval_->Init(args);
-  }
-
-  char const* Name() const override {
-    return "distcol";
-  }
-
-  void Update(HostDeviceVector<GradientPair> *gpair,
-              DMatrix* dmat,
-              const std::vector<RegTree*> &trees) override {
-    CHECK_EQ(trees.size(), 1U) << "DistColMaker: only support one tree at a time";
-    Builder builder(
-      param_,
-      std::unique_ptr<SplitEvaluator>(spliteval_->GetHostClone()),
-      interaction_constraints_);
-    // build the tree
-    builder.Update(gpair->ConstHostVector(), dmat, trees[0]);
-    //// prune the tree, note that pruner will sync the tree
-    pruner_->Update(gpair, dmat, trees);
-    // update position after the tree is pruned
-    builder.UpdatePosition(dmat, *trees[0]);
-  }
-
- private:
-  class Builder : public ColMaker::Builder {
-   public:
-    explicit Builder(const TrainParam &param,
-                     std::unique_ptr<SplitEvaluator> spliteval,
-                     FeatureInteractionConstraintHost _interaction_constraints)
-        : ColMaker::Builder(param, std::move(spliteval), std::move(_interaction_constraints)) {}
-    inline void UpdatePosition(DMatrix* p_fmat, const RegTree &tree) {
-      const auto ndata = static_cast<bst_omp_uint>(p_fmat->Info().num_row_);
-      #pragma omp parallel for schedule(static)
-      for (bst_omp_uint ridx = 0; ridx < ndata; ++ridx) {
-        int nid = this->DecodePosition(ridx);
-        while (tree[nid].IsDeleted()) {
-          nid = tree[nid].Parent();
-          CHECK_GE(nid, 0);
-        }
-        this->position_[ridx] = nid;
-      }
-    }
-
-   protected:
-    void SetNonDefaultPosition(const std::vector<int> &qexpand, DMatrix *p_fmat,
-                               const RegTree &tree) override {
-      // step 2, classify the non-default data into right places
-      std::vector<unsigned> fsplits;
-      for (int nid : qexpand) {
-        if (!tree[nid].IsLeaf()) {
-          fsplits.push_back(tree[nid].SplitIndex());
-        }
-      }
-      // get the candidate split index
-      std::sort(fsplits.begin(), fsplits.end());
-      fsplits.resize(std::unique(fsplits.begin(), fsplits.end()) - fsplits.begin());
-      while (fsplits.size() != 0 && fsplits.back() >= p_fmat->Info().num_col_) {
-        fsplits.pop_back();
-      }
-      // bitmap is only word concurrent, set to bool first
-      {
-        auto ndata = static_cast<bst_omp_uint>(this->position_.size());
-        boolmap_.resize(ndata);
-        #pragma omp parallel for schedule(static)
-        for (bst_omp_uint j = 0; j < ndata; ++j) {
-            boolmap_[j] = 0;
-        }
-      }
-      for (const auto &batch : p_fmat->GetBatches<SortedCSCPage>()) {
-        for (auto fid : fsplits) {
-          auto col = batch[fid];
-          const auto ndata = static_cast<bst_omp_uint>(col.size());
-          #pragma omp parallel for schedule(static)
-          for (bst_omp_uint j = 0; j < ndata; ++j) {
-            const bst_uint ridx = col[j].index;
-            const bst_float fvalue = col[j].fvalue;
-            const int nid = this->DecodePosition(ridx);
-            if (!tree[nid].IsLeaf() && tree[nid].SplitIndex() == fid) {
-              if (fvalue < tree[nid].SplitCond()) {
-                if (!tree[nid].DefaultLeft()) boolmap_[ridx] = 1;
-              } else {
-                if (tree[nid].DefaultLeft()) boolmap_[ridx] = 1;
-              }
-            }
-          }
-        }
-      }
-
-      bitmap_.InitFromBool(boolmap_);
-      // communicate bitmap
-      rabit::Allreduce<rabit::op::BitOR>(dmlc::BeginPtr(bitmap_.data), bitmap_.data.size());
-      // get the new position
-      const auto ndata = static_cast<bst_omp_uint>(p_fmat->Info().num_row_);
-      #pragma omp parallel for schedule(static)
-      for (bst_omp_uint ridx = 0; ridx < ndata; ++ridx) {
-        const int nid = this->DecodePosition(ridx);
-        if (bitmap_.Get(ridx)) {
-          CHECK(!tree[nid].IsLeaf()) << "inconsistent reduce information";
-          if (tree[nid].DefaultLeft()) {
-            this->SetEncodePosition(ridx, tree[nid].RightChild());
-          } else {
-            this->SetEncodePosition(ridx, tree[nid].LeftChild());
-          }
-        }
-      }
-    }
-    // synchronize the best solution of each node
-    void SyncBestSolution(const std::vector<int> &qexpand) override {
-      std::vector<SplitEntry> vec;
-      for (int nid : qexpand) {
-        for (int tid = 0; tid < this->nthread_; ++tid) {
-          this->snode_[nid].best.Update(this->stemp_[tid][nid].best);
-        }
-        vec.push_back(this->snode_[nid].best);
-      }
-      // TODO(tqchen) lazy version
-      // communicate best solution
-      reducer_.Allreduce(dmlc::BeginPtr(vec), vec.size());
-      // assign solution back
-      for (size_t i = 0; i < qexpand.size(); ++i) {
-        const int nid = qexpand[i];
-        this->snode_[nid].best = vec[i];
-      }
-    }
-
-   private:
-    common::BitMap bitmap_;
-    std::vector<int> boolmap_;
-    rabit::Reducer<SplitEntry, SplitEntry::Reduce> reducer_;
-  };
-  // we directly introduce pruner here
-  std::unique_ptr<TreeUpdater> pruner_;
-  // training parameter
-  TrainParam param_;
-  // Cloned for each builder instantiation
-  std::unique_ptr<SplitEvaluator> spliteval_;
-
-  FeatureInteractionConstraintHost interaction_constraints_;
 };
 
 XGBOOST_REGISTER_TREE_UPDATER(ColMaker, "grow_colmaker")
 .describe("Grow tree with parallelization over columns.")
 .set_body([]() {
     return new ColMaker();
-  });
-
-XGBOOST_REGISTER_TREE_UPDATER(DistColMaker, "distcol")
-.describe("Distributed column split version of tree maker.")
-.set_body([]() {
-    return new DistColMaker();
   });
 }  // namespace tree
 }  // namespace xgboost

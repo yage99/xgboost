@@ -9,6 +9,7 @@
 
 #include <dmlc/base.h>
 #include <dmlc/data.h>
+#include <dmlc/serializer.h>
 #include <rabit/rabit.h>
 #include <xgboost/base.h>
 #include <xgboost/span.h>
@@ -22,17 +23,20 @@
 #include <vector>
 
 namespace xgboost {
-// forward declare learner.
-class LearnerImpl;
 // forward declare dmatrix.
 class DMatrix;
 
 /*! \brief data type accepted by xgboost interface */
-enum DataType {
+enum class DataType : uint8_t {
   kFloat32 = 1,
   kDouble = 2,
   kUInt32 = 3,
-  kUInt64 = 4
+  kUInt64 = 4,
+  kStr = 5
+};
+
+enum class FeatureType : uint8_t {
+  kNumerical
 };
 
 /*!
@@ -40,34 +44,86 @@ enum DataType {
  */
 class MetaInfo {
  public:
+  /*! \brief number of data fields in MetaInfo */
+  static constexpr uint64_t kNumField = 11;
+
   /*! \brief number of rows in the data */
-  uint64_t num_row_{0};
+  uint64_t num_row_{0};  // NOLINT
   /*! \brief number of columns in the data */
-  uint64_t num_col_{0};
+  uint64_t num_col_{0};  // NOLINT
   /*! \brief number of nonzero entries in the data */
-  uint64_t num_nonzero_{0};
+  uint64_t num_nonzero_{0};  // NOLINT
   /*! \brief label of each instance */
-  HostDeviceVector<bst_float> labels_;
-  /*!
-   * \brief specified root index of each instance,
-   *  can be used for multi task setting
-   */
-  std::vector<bst_uint> root_index_;
+  HostDeviceVector<bst_float> labels_;  // NOLINT
   /*!
    * \brief the index of begin and end of a group
    *  needed when the learning task is ranking.
    */
-  std::vector<bst_group_t> group_ptr_;
+  std::vector<bst_group_t> group_ptr_;  // NOLINT
   /*! \brief weights of each instance, optional */
-  HostDeviceVector<bst_float> weights_;
+  HostDeviceVector<bst_float> weights_;  // NOLINT
   /*!
    * \brief initialized margins,
    * if specified, xgboost will start from this init margin
    * can be used to specify initial prediction to boost from.
    */
-  HostDeviceVector<bst_float> base_margin_;
+  HostDeviceVector<bst_float> base_margin_;  // NOLINT
+  /*!
+   * \brief lower bound of the label, to be used for survival analysis (censored regression)
+   */
+  HostDeviceVector<bst_float> labels_lower_bound_;  // NOLINT
+  /*!
+   * \brief upper bound of the label, to be used for survival analysis (censored regression)
+   */
+  HostDeviceVector<bst_float> labels_upper_bound_;  // NOLINT
+
+  /*!
+   * \brief Name of type for each feature provided by users. Eg. "int"/"float"/"i"/"q"
+   */
+  std::vector<std::string> feature_type_names;
+  /*!
+   * \brief Name for each feature.
+   */
+  std::vector<std::string> feature_names;
+  /*
+   * \brief Type of each feature.  Automatically set when feature_type_names is specifed.
+   */
+  HostDeviceVector<FeatureType> feature_types;
+
   /*! \brief default constructor */
   MetaInfo()  = default;
+  MetaInfo(MetaInfo&& that) = default;
+  MetaInfo& operator=(MetaInfo&& that) = default;
+  MetaInfo& operator=(MetaInfo const& that) {
+    this->num_row_ = that.num_row_;
+    this->num_col_ = that.num_col_;
+    this->num_nonzero_ = that.num_nonzero_;
+
+    this->labels_.Resize(that.labels_.Size());
+    this->labels_.Copy(that.labels_);
+
+    this->group_ptr_ = that.group_ptr_;
+
+    this->weights_.Resize(that.weights_.Size());
+    this->weights_.Copy(that.weights_);
+
+    this->base_margin_.Resize(that.base_margin_.Size());
+    this->base_margin_.Copy(that.base_margin_);
+
+    this->labels_lower_bound_.Resize(that.labels_lower_bound_.Size());
+    this->labels_lower_bound_.Copy(that.labels_lower_bound_);
+
+    this->labels_upper_bound_.Resize(that.labels_upper_bound_.Size());
+    this->labels_upper_bound_.Copy(that.labels_upper_bound_);
+    return *this;
+  }
+
+  /*!
+   * \brief Validate all metainfo.
+   */
+  void Validate(int32_t device) const;
+
+  MetaInfo Slice(common::Span<int32_t const> ridxs) const;
   /*!
    * \brief Get weight of each instances.
    * \param i Instance index.
@@ -75,14 +131,6 @@ class MetaInfo {
    */
   inline bst_float GetWeight(size_t i) const {
     return weights_.Size() != 0 ?  weights_.HostVector()[i] : 1.0f;
-  }
-  /*!
-   * \brief Get the root index of i-th instance.
-   * \param i Instance index.
-   * \return The pre-defined root index of i-th instance.
-   */
-  inline unsigned GetRoot(size_t i) const {
-    return !root_index_.empty() ? root_index_[i] : 0U;
   }
   /*! \brief get sorted indexes (argsort) of labels by absolute value (used by cox loss) */
   inline const std::vector<size_t>& LabelAbsSort() const {
@@ -128,6 +176,22 @@ class MetaInfo {
    */
   void SetInfo(const char* key, std::string const& interface_str);
 
+  void GetInfo(char const* key, bst_ulong* out_len, DataType dtype,
+               const void** out_dptr) const;
+
+  void SetFeatureInfo(const char *key, const char **info, const bst_ulong size);
+  void GetFeatureInfo(const char *field, std::vector<std::string>* out_str_vecs) const;
+
+  /*
+   * \brief Extend with other MetaInfo.
+   *
+   * \param that The other MetaInfo object.
+   *
+   * \param accumulate_rows Whether rows need to be accumulated in this function.  If
+   *        client code knows number of rows in advance, set this parameter to false.
+   */
+  void Extend(MetaInfo const& that, bool accumulate_rows);
+
  private:
   /*! \brief argsort of labels */
   mutable std::vector<size_t> label_order_cache_;
@@ -146,7 +210,7 @@ struct Entry {
    * \param index The feature or row index.
    * \param fvalue The feature value.
    */
-  Entry(bst_feature_t index, bst_float fvalue) : index(index), fvalue(fvalue) {}
+  XGBOOST_DEVICE Entry(bst_feature_t index, bst_float fvalue) : index(index), fvalue(fvalue) {}
   /*! \brief reversely compare feature values */
   inline static bool CmpValue(const Entry& a, const Entry& b) {
     return a.fvalue < b.fvalue;
@@ -163,17 +227,15 @@ struct BatchParam {
   /*! \brief The GPU device to use. */
   int gpu_id;
   /*! \brief Maximum number of bins per feature for histograms. */
-  int max_bin;
-  /*! \brief Number of rows in a GPU batch, used for finding quantiles on GPU. */
-  int gpu_batch_nrows;
+  int max_bin{0};
   /*! \brief Page size for external memory mode. */
   size_t gpu_page_size;
-
+  BatchParam() = default;
+  BatchParam(int32_t device, int32_t max_bin, size_t gpu_page_size = 0)
+      : gpu_id{device}, max_bin{max_bin}, gpu_page_size{gpu_page_size} {}
   inline bool operator!=(const BatchParam& other) const {
-    return gpu_id != other.gpu_id ||
-        max_bin != other.max_bin ||
-        gpu_batch_nrows != other.gpu_batch_nrows ||
-        gpu_page_size != other.gpu_page_size;
+    return gpu_id != other.gpu_id || max_bin != other.max_bin ||
+           gpu_page_size != other.gpu_page_size;
   }
 };
 
@@ -215,7 +277,7 @@ class SparsePage {
 
   /*! \return Number of instances in the page. */
   inline size_t Size() const {
-    return offset.Size() - 1;
+    return offset.Size() == 0 ? 0 : offset.Size() - 1;
   }
 
   /*! \return estimation of memory cost of this page */
@@ -257,6 +319,20 @@ class SparsePage {
    * \param batch the row batch.
    */
   void Push(const dmlc::RowBlock<uint32_t>& batch);
+
+  /**
+   * \brief Pushes external data batch onto this page
+   *
+   * \tparam  AdapterBatchT
+   * \param batch
+   * \param missing
+   * \param nthread
+   *
+   * \return  The maximum number of columns encountered in this input batch. Useful when pushing many adapter batches to work out the total number of columns.
+   */
+  template <typename AdapterBatchT>
+  uint64_t Push(const AdapterBatchT& batch, float missing, int nthread);
+
   /*!
    * \brief Push a sparse page
    * \param batch the row page
@@ -309,6 +385,8 @@ class EllpackPage {
   /*! \brief Destructor. */
   ~EllpackPage();
 
+  EllpackPage(EllpackPage&& that);
+
   /*! \return Number of instances in the page. */
   size_t Size() const;
 
@@ -335,7 +413,7 @@ class BatchIteratorImpl {
 template<typename T>
 class BatchIterator {
  public:
-  using iterator_category = std::forward_iterator_tag;
+  using iterator_category = std::forward_iterator_tag;  // NOLINT
   explicit BatchIterator(BatchIteratorImpl<T>* impl) { impl_.reset(impl); }
 
   void operator++() {
@@ -370,41 +448,18 @@ class BatchIterator {
 template<typename T>
 class BatchSet {
  public:
-  explicit BatchSet(BatchIterator<T> begin_iter) : begin_iter_(begin_iter) {}
-  BatchIterator<T> begin() { return begin_iter_; }
-  BatchIterator<T> end() { return BatchIterator<T>(nullptr); }
+  explicit BatchSet(BatchIterator<T> begin_iter) : begin_iter_(std::move(begin_iter)) {}
+  BatchIterator<T> begin() { return begin_iter_; }  // NOLINT
+  BatchIterator<T> end() { return BatchIterator<T>(nullptr); }  // NOLINT
 
  private:
   BatchIterator<T> begin_iter_;
 };
 
-/*!
- * \brief This is data structure that user can pass to DMatrix::Create
- *  to create a DMatrix for training, user can create this data structure
- *  for customized Data Loading on single machine.
- *
- *  On distributed setting, usually an customized dmlc::Parser is needed instead.
- */
-template<typename T>
-class DataSource : public dmlc::DataIter<T> {
- public:
-  /*!
-   * \brief Meta information about the dataset
-   * The subclass need to be able to load this correctly from data.
-   */
-  MetaInfo info;
-};
+struct XGBAPIThreadLocalEntry;
 
 /*!
  * \brief Internal data structured used by XGBoost during training.
- *  There are two ways to create a customized DMatrix that reads in user defined-format.
- *
- *  - Provide a dmlc::Parser and pass into the DMatrix::Create
- *  - Alternatively, if data can be represented by an URL, define a new dmlc::Parser and register by
- *    DMLC_REGISTER_DATA_PARSER;
- *      - This works best for user defined data input source, such as data-base, filesystem.
- *  - Provide a DataSource, that can be passed to DMatrix::Create
- *      This can be used to re-use inmemory data structure into DMatrix.
  */
 class DMatrix {
  public:
@@ -412,28 +467,32 @@ class DMatrix {
   DMatrix()  = default;
   /*! \brief meta information of the dataset */
   virtual MetaInfo& Info() = 0;
+  virtual void SetInfo(const char *key, const void *dptr, DataType dtype,
+                       size_t num) {
+    this->Info().SetInfo(key, dptr, dtype, num);
+  }
+  virtual void SetInfo(const char* key, std::string const& interface_str) {
+    this->Info().SetInfo(key, interface_str);
+  }
   /*! \brief meta information of the dataset */
   virtual const MetaInfo& Info() const = 0;
+
+  /*! \brief Get thread local memory for returning data from DMatrix. */
+  XGBAPIThreadLocalEntry& GetThreadLocal() const;
+
   /**
    * \brief Gets batches. Use range based for loop over BatchSet to access individual batches.
    */
   template<typename T>
   BatchSet<T> GetBatches(const BatchParam& param = {});
+  template <typename T>
+  bool PageExists() const;
+
   // the following are column meta data, should be able to answer them fast.
   /*! \return Whether the data columns single column block. */
   virtual bool SingleColBlock() const = 0;
-  /*! \brief get column density */
-  virtual float GetColDensity(size_t cidx) = 0;
   /*! \brief virtual destructor */
-  virtual ~DMatrix() = default;
-  /*!
-   * \brief Save DMatrix to local file.
-   *  The saved file only works for non-sharded dataset(single machine training).
-   *  This API is deprecated and dis-encouraged to use.
-   * \param fname The file name to be saved.
-   * \return The created DMatrix.
-   */
-  virtual void SaveToLocalFile(const std::string& fname);
+  virtual ~DMatrix();
 
   /*! \brief Whether the matrix is dense. */
   bool IsDense() const {
@@ -456,32 +515,50 @@ class DMatrix {
                        const std::string& file_format = "auto",
                        size_t page_size = kPageSize);
 
-  /*!
-   * \brief create a new DMatrix, by wrapping a row_iterator, and meta info.
-   * \param source The source iterator of the data, the create function takes ownership of the source.
-   * \param cache_prefix The path to prefix of temporary cache file of the DMatrix when used in external memory mode.
-   *     This can be nullptr for common cases, and in-memory mode will be used.
-   * \return a Created DMatrix.
+  /**
+   * \brief Creates a new DMatrix from an external data adapter.
+   *
+   * \tparam  AdapterT  Type of the adapter.
+   * \param [in,out]  adapter       View onto an external data.
+   * \param           missing       Values to count as missing.
+   * \param           nthread       Number of threads for construction.
+   * \param           cache_prefix  (Optional) The cache prefix for external memory.
+   * \param           page_size     (Optional) Size of the page.
+   *
+   * \return  a Created DMatrix.
    */
-  static DMatrix* Create(std::unique_ptr<DataSource<SparsePage>>&& source,
-                         const std::string& cache_prefix = "");
-  /*!
-   * \brief Create a DMatrix by loading data from parser.
-   *  Parser can later be deleted after the DMatrix i created.
-   * \param parser The input data parser
-   * \param cache_prefix The path to prefix of temporary cache file of the DMatrix when used in external memory mode.
-   *     This can be nullptr for common cases, and in-memory mode will be used.
-   * \param page_size Page size for external memory.
-   * \sa dmlc::Parser
-   * \note dmlc-core provides efficient distributed data parser for libsvm format.
-   *  User can create and register customized parser to load their own format using DMLC_REGISTER_DATA_PARSER.
-   *  See "dmlc-core/include/dmlc/data.h" for detail.
-   * \return A created DMatrix.
-   */
-  static DMatrix* Create(dmlc::Parser<uint32_t>* parser,
+  template <typename AdapterT>
+  static DMatrix* Create(AdapterT* adapter, float missing, int nthread,
                          const std::string& cache_prefix = "",
                          size_t page_size = kPageSize);
 
+  /**
+   * \brief Create a new Quantile based DMatrix used for histogram based algorithm.
+   *
+   * \tparam DataIterHandle         External iterator type, defined in C API.
+   * \tparam DMatrixHandle          DMatrix handle, defined in C API.
+   * \tparam DataIterResetCallback  Callback for reset, prototype defined in C API.
+   * \tparam XGDMatrixCallbackNext  Callback for next, prototype defined in C API.
+   *
+   * \param iter    External data iterator
+   * \param proxy   A hanlde to ProxyDMatrix
+   * \param reset   Callback for reset
+   * \param next    Callback for next
+   * \param missing Value that should be treated as missing.
+   * \param nthread number of threads used for initialization.
+   * \param max_bin Maximum number of bins.
+   *
+   * \return A created quantile based DMatrix.
+   */
+  template <typename DataIterHandle, typename DMatrixHandle,
+            typename DataIterResetCallback, typename XGDMatrixCallbackNext>
+  static DMatrix *Create(DataIterHandle iter, DMatrixHandle proxy,
+                         DataIterResetCallback *reset,
+                         XGDMatrixCallbackNext *next, float missing,
+                         int nthread,
+                         int max_bin);
+
+      virtual DMatrix *Slice(common::Span<int32_t const> ridxs) = 0;
   /*! \brief page size 32 MB */
   static const size_t kPageSize = 32UL << 20UL;
 
@@ -490,11 +567,24 @@ class DMatrix {
   virtual BatchSet<CSCPage> GetColumnBatches() = 0;
   virtual BatchSet<SortedCSCPage> GetSortedColumnBatches() = 0;
   virtual BatchSet<EllpackPage> GetEllpackBatches(const BatchParam& param) = 0;
+
+  virtual bool EllpackExists() const = 0;
+  virtual bool SparsePageExists() const = 0;
 };
 
 template<>
 inline BatchSet<SparsePage> DMatrix::GetBatches(const BatchParam&) {
   return GetRowBatches();
+}
+
+template<>
+inline bool DMatrix::PageExists<EllpackPage>() const {
+  return this->EllpackExists();
+}
+
+template<>
+inline bool DMatrix::PageExists<SparsePage>() const {
+  return this->SparsePageExists();
 }
 
 template<>
@@ -515,5 +605,21 @@ inline BatchSet<EllpackPage> DMatrix::GetBatches(const BatchParam& param) {
 
 namespace dmlc {
 DMLC_DECLARE_TRAITS(is_pod, xgboost::Entry, true);
-}
+
+namespace serializer {
+
+template <>
+struct Handler<xgboost::Entry> {
+  inline static void Write(Stream* strm, const xgboost::Entry& data) {
+    strm->Write(data.index);
+    strm->Write(data.fvalue);
+  }
+
+  inline static bool Read(Stream* strm, xgboost::Entry* data) {
+    return strm->Read(&data->index) && strm->Read(&data->fvalue);
+  }
+};
+
+}  // namespace serializer
+}  // namespace dmlc
 #endif  // XGBOOST_DATA_H_

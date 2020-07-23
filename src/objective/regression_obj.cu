@@ -41,10 +41,11 @@ struct RegLossParam : public XGBoostParameter<RegLossParam> {
 template<typename Loss>
 class RegLossObj : public ObjFunction {
  protected:
-  HostDeviceVector<int> label_correct_;
+  HostDeviceVector<float> additional_input_;
 
  public:
-  RegLossObj() = default;
+  // 0 - label_correct flag, 1 - scale_pos_weight, 2 - is_null_weight
+  RegLossObj(): additional_input_(3) {}
 
   void Configure(const std::vector<std::pair<std::string, std::string> >& args) override {
     param_.UpdateAllowUnknown(args);
@@ -58,45 +59,51 @@ class RegLossObj : public ObjFunction {
       LOG(WARNING) << "Label set is empty.";
     }
     CHECK_EQ(preds.Size(), info.labels_.Size())
-        << "labels are not correctly provided"
-        << "preds.size=" << preds.Size() << ", label.size=" << info.labels_.Size();
-    size_t ndata = preds.Size();
+        << " " << "labels are not correctly provided"
+        << "preds.size=" << preds.Size() << ", label.size=" << info.labels_.Size() << ", "
+        << "Loss: " << Loss::Name();
+    size_t const ndata = preds.Size();
     out_gpair->Resize(ndata);
     auto device = tparam_->gpu_id;
-    label_correct_.Resize(1);
-    label_correct_.Fill(1);
+    additional_input_.HostVector().begin()[0] = 1;  // Fill the label_correct flag
 
     bool is_null_weight = info.weights_.Size() == 0;
+    if (!is_null_weight) {
+      CHECK_EQ(info.weights_.Size(), ndata)
+          << "Number of weights should be equal to number of data points.";
+    }
     auto scale_pos_weight = param_.scale_pos_weight;
-    common::Transform<>::Init(
-        [=] XGBOOST_DEVICE(size_t _idx,
-                           common::Span<int> _label_correct,
+    additional_input_.HostVector().begin()[1] = scale_pos_weight;
+    additional_input_.HostVector().begin()[2] = is_null_weight;
+
+    common::Transform<>::Init([] XGBOOST_DEVICE(size_t _idx,
+                           common::Span<float> _additional_input,
                            common::Span<GradientPair> _out_gpair,
                            common::Span<const bst_float> _preds,
                            common::Span<const bst_float> _labels,
                            common::Span<const bst_float> _weights) {
+          const float _scale_pos_weight = _additional_input[1];
+          const bool _is_null_weight = _additional_input[2];
+
           bst_float p = Loss::PredTransform(_preds[_idx]);
-          bst_float w = is_null_weight ? 1.0f : _weights[_idx];
+          bst_float w = _is_null_weight ? 1.0f : _weights[_idx];
           bst_float label = _labels[_idx];
           if (label == 1.0f) {
-            w *= scale_pos_weight;
+            w *= _scale_pos_weight;
           }
           if (!Loss::CheckLabel(label)) {
             // If there is an incorrect label, the host code will know.
-            _label_correct[0] = 0;
+            _additional_input[0] = 0;
           }
           _out_gpair[_idx] = GradientPair(Loss::FirstOrderGradient(p, label) * w,
                                           Loss::SecondOrderGradient(p, label) * w);
         },
         common::Range{0, static_cast<int64_t>(ndata)}, device).Eval(
-            &label_correct_, out_gpair, &preds, &info.labels_, &info.weights_);
+            &additional_input_, out_gpair, &preds, &info.labels_, &info.weights_);
 
-    // copy "label correct" flags back to host
-    std::vector<int>& label_correct_h = label_correct_.HostVector();
-    for (auto const flag : label_correct_h) {
-      if (flag == 0) {
-        LOG(FATAL) << Loss::LabelErrorMsg();
-      }
+    auto const flag = additional_input_.HostVector().begin()[0];
+    if (flag == 0) {
+      LOG(FATAL) << Loss::LabelErrorMsg();
     }
   }
 
@@ -121,11 +128,11 @@ class RegLossObj : public ObjFunction {
   void SaveConfig(Json* p_out) const override {
     auto& out = *p_out;
     out["name"] = String(Loss::Name());
-    out["reg_loss_param"] = toJson(param_);
+    out["reg_loss_param"] = ToJson(param_);
   }
 
   void LoadConfig(Json const& in) override {
-    fromJson(in["reg_loss_param"], &param_);
+    FromJson(in["reg_loss_param"], &param_);
   }
 
  protected:
@@ -146,6 +153,10 @@ XGBOOST_REGISTER_OBJECTIVE(SquareLogError, SquaredLogError::Name())
 XGBOOST_REGISTER_OBJECTIVE(LogisticRegression, LogisticRegression::Name())
 .describe("Logistic regression for probability regression task.")
 .set_body([]() { return new RegLossObj<LogisticRegression>(); });
+
+XGBOOST_REGISTER_OBJECTIVE(PseudoHuberError, PseudoHuberError::Name())
+.describe("Regression Pseudo Huber error.")
+.set_body([]() { return new RegLossObj<PseudoHuberError>(); });
 
 XGBOOST_REGISTER_OBJECTIVE(LogisticClassification, LogisticClassification::Name())
 .describe("Logistic regression for binary classification task.")
@@ -188,13 +199,17 @@ class PoissonRegression : public ObjFunction {
                    HostDeviceVector<GradientPair> *out_gpair) override {
     CHECK_NE(info.labels_.Size(), 0U) << "label set cannot be empty";
     CHECK_EQ(preds.Size(), info.labels_.Size()) << "labels are not correctly provided";
-    size_t ndata = preds.Size();
+    size_t const ndata = preds.Size();
     out_gpair->Resize(ndata);
     auto device = tparam_->gpu_id;
     label_correct_.Resize(1);
     label_correct_.Fill(1);
 
     bool is_null_weight = info.weights_.Size() == 0;
+    if (!is_null_weight) {
+      CHECK_EQ(info.weights_.Size(), ndata)
+          << "Number of weights should be equal to number of data points.";
+    }
     bst_float max_delta_step = param_.max_delta_step;
     common::Transform<>::Init(
         [=] XGBOOST_DEVICE(size_t _idx,
@@ -244,11 +259,11 @@ class PoissonRegression : public ObjFunction {
   void SaveConfig(Json* p_out) const override {
     auto& out = *p_out;
     out["name"] = String("count:poisson");
-    out["poisson_regression_param"] = toJson(param_);
+    out["poisson_regression_param"] = ToJson(param_);
   }
 
   void LoadConfig(Json const& in) override {
-    fromJson(in["poisson_regression_param"], &param_);
+    FromJson(in["poisson_regression_param"], &param_);
   }
 
  private:
@@ -282,6 +297,11 @@ class CoxRegression : public ObjFunction {
     const std::vector<size_t> &label_order = info.LabelAbsSort();
 
     const omp_ulong ndata = static_cast<omp_ulong>(preds_h.size()); // NOLINT(*)
+    const bool is_null_weight = info.weights_.Size() == 0;
+    if (!is_null_weight) {
+      CHECK_EQ(info.weights_.Size(), ndata)
+          << "Number of weights should be equal to number of data points.";
+    }
 
     // pre-compute a sum
     double exp_p_sum = 0;  // we use double because we might need the precision with large datasets
@@ -377,6 +397,10 @@ class GammaRegression : public ObjFunction {
     label_correct_.Fill(1);
 
     const bool is_null_weight = info.weights_.Size() == 0;
+    if (!is_null_weight) {
+      CHECK_EQ(info.weights_.Size(), ndata)
+          << "Number of weights should be equal to number of data points.";
+    }
     common::Transform<>::Init(
         [=] XGBOOST_DEVICE(size_t _idx,
                            common::Span<int> _label_correct,
@@ -471,6 +495,11 @@ class TweedieRegression : public ObjFunction {
     label_correct_.Fill(1);
 
     const bool is_null_weight = info.weights_.Size() == 0;
+    if (!is_null_weight) {
+      CHECK_EQ(info.weights_.Size(), ndata)
+          << "Number of weights should be equal to number of data points.";
+    }
+
     const float rho = param_.tweedie_variance_power;
     common::Transform<>::Init(
         [=] XGBOOST_DEVICE(size_t _idx,
@@ -523,10 +552,10 @@ class TweedieRegression : public ObjFunction {
   void SaveConfig(Json* p_out) const override {
     auto& out = *p_out;
     out["name"] = String("reg:tweedie");
-    out["tweedie_regression_param"] = toJson(param_);
+    out["tweedie_regression_param"] = ToJson(param_);
   }
   void LoadConfig(Json const& in) override {
-    fromJson(in["tweedie_regression_param"], &param_);
+    FromJson(in["tweedie_regression_param"], &param_);
   }
 
  private:

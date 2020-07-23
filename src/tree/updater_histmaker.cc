@@ -119,10 +119,7 @@ class HistMaker: public BaseMaker {
     this->InitData(gpair, *p_fmat, *p_tree);
     this->InitWorkSet(p_fmat, *p_tree, &selected_features_);
     // mark root node as fresh.
-    for (int i = 0; i < p_tree->param.num_roots; ++i) {
-      (*p_tree)[i].SetLeaf(0.0f, 0);
-    }
-    CHECK_EQ(p_tree->param.num_roots, 1) << "Support for num roots is removed.";
+    (*p_tree)[0].SetLeaf(0.0f, 0);
 
     for (int depth = 0; depth < param_.max_depth; ++depth) {
       // reset and propose candidate split
@@ -252,7 +249,8 @@ class HistMaker: public BaseMaker {
         p_tree->ExpandNode(nid, best.SplitIndex(), best.split_value,
                            best.DefaultLeft(), base_weight, left_leaf_weight,
                            right_leaf_weight, best.loss_chg,
-                           node_sum.sum_hess);
+                           node_sum.sum_hess,
+                           best.left_sum.GetHess(), best.right_sum.GetHess());
         GradStats right_sum;
         right_sum.SetSubstract(node_sum, left_sum[wid]);
         auto left_child = (*p_tree)[nid].LeftChild();
@@ -701,7 +699,7 @@ class GlobalProposalHistMaker: public CQHistMaker {
       this->work_set_.insert(this->work_set_.end(), this->fsplit_set_.begin(),
                              this->fsplit_set_.end());
       XGBOOST_PARALLEL_SORT(this->work_set_.begin(), this->work_set_.end(),
-                            std::less<decltype(this->work_set_)::value_type>{});
+                            std::less<>{});
       this->work_set_.resize(
           std::unique(this->work_set_.begin(), this->work_set_.end()) - this->work_set_.begin());
 
